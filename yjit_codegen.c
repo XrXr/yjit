@@ -42,6 +42,8 @@ static void *leave_exit_code;
 // Code for full logic of returning from C method and exiting to the interpreter
 static uint32_t outline_full_cfunc_return_pos;
 
+static FILE *perf_map_file;
+
 // For implementing global code invalidation
 struct codepage_patch {
     uint32_t inline_patch_pos;
@@ -57,6 +59,46 @@ static patch_array_t global_inval_patches = NULL;
 // should make changes to the invalidated code region anymore. This is used to
 // break out of invalidation race when there are multiple ractors.
 uint32_t yjit_codepage_frozen_bytes = 0;
+
+
+typedef struct perf_region {
+    char range_label[0x400];
+
+    unsigned long range_start;
+} perf_region_t;
+
+static perf_region_t perf_region;
+
+
+// Note: using strcpy and strcat because this is not menat to be merged
+static void
+perf_region_start(perf_region_t *perf, codeblock_t *cb, const char *label)
+{
+    if (perf->range_start) rb_bug("starting while already started");
+    perf->range_start = (unsigned long)cb_get_ptr(cb, cb->write_pos);
+    strcpy(perf->range_label, label);
+}
+
+static void
+perf_region_append(perf_region_t *perf, const char *label)
+{
+    if (!perf->range_start) rb_bug("append before starting");
+    strcat(perf->range_label, label);
+}
+
+static void
+perf_region_end(perf_region_t *perf)
+{
+    if (!perf->range_start) rb_bug("ending before starting");
+    unsigned long current_pos = (unsigned long)cb_get_ptr(cb, cb->write_pos);
+    unsigned long start = perf->range_start;
+    unsigned long region_size = current_pos - start;
+    if (region_size > 0) {
+        fprintf(perf_map_file, "%lx %lx %s\n", start, region_size, perf->range_label);
+    }
+    perf->range_start = 0;
+    perf->range_label[0] = 0;
+}
 
 // Print the current source location for debugging purposes
 RBIMPL_ATTR_MAYBE_UNUSED()
@@ -676,8 +718,19 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
         // Add a comment for the name of the YARV instruction
         ADD_COMMENT(cb, insn_name(opcode));
 
+
+
+        perf_region_start(&perf_region, cb, insn_name(opcode));
+
+
+
         // Call the code generation function
         codegen_status_t status = gen_fn(&jit, ctx);
+
+
+
+        perf_region_end(&perf_region);
+
 
         // For now, reset the chain depth after each instruction as only the
         // first instruction in the block can concern itself with the depth.
@@ -689,7 +742,10 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
             // TODO: if the codegen funcion makes changes to ctx and then return YJIT_CANT_COMPILE,
             // the exit this generates would be wrong. We could save a copy of the entry context
             // and assert that ctx is the same here.
+            perf_region_start(&perf_region, cb, insn_name(opcode));
+            perf_region_append(&perf_region, ".cantcompile");
             yjit_gen_exit(jit.pc, ctx, cb);
+            perf_region_end(&perf_region);
             break;
         }
 
@@ -2170,6 +2226,8 @@ gen_opt_aref(jitstate_t *jit, ctx_t *ctx)
             mov(cb, stack_ret, RAX);
         }
 
+        perf_region_append(&perf_region, ".array");
+
         // Jump to next instruction. This allows guard chains to share the same successor.
         jit_jump_to_next_insn(jit, ctx);
         return YJIT_END_BLOCK;
@@ -2216,6 +2274,8 @@ gen_opt_aref(jitstate_t *jit, ctx_t *ctx)
             x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
             mov(cb, stack_ret, RAX);
         }
+
+        perf_region_append(&perf_region, ".hash");
 
         // Jump to next instruction. This allows guard chains to share the same successor.
         jit_jump_to_next_insn(jit, ctx);
@@ -3143,6 +3203,8 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     // cfunc calls may corrupt types
     ctx_clear_local_types(ctx);
 
+    perf_region_append(&perf_region, ".cfunc");
+
     // Note: the return block of gen_send_iseq() has ctx->sp_offset == 1
     // which allows for sharing the same successor.
 
@@ -3429,6 +3491,8 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
 
     // Load the updated SP from the CFP
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
+
+    perf_region_append(&perf_region, ".iseq");
 
     // Directly jump to the entry point of the callee
     gen_direct_jump(
@@ -4136,6 +4200,15 @@ yjit_init_codegen(void)
 
     // Generate full exit code for C func
     gen_full_cfunc_return();
+
+    // open file for perf map file
+    // TODO: close it
+    {
+        char buf[1024];
+        int ret = snprintf(buf, sizeof(buf), "/tmp/perf-%ld.map", (long)getpid());
+        if (ret < 0) rb_bug("snprintf failed");
+        perf_map_file = fopen(buf, "w+");
+    }
 
     // Map YARV opcodes to the corresponding codegen functions
     yjit_reg_op(BIN(nop), gen_nop);
