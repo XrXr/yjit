@@ -851,6 +851,9 @@ uint8_t* get_branch_target(
         return cb_get_ptr(cb, p_block->start_pos);
     }
 
+    perf_region_t region = {0};
+    perf_region_start(&region, ocb, "_outlined_lazy_stub");
+
     // Generate an outlined stub that will call branch_stub_hit()
     uint8_t* stub_addr = cb_get_ptr(ocb, ocb->write_pos);
 
@@ -863,6 +866,8 @@ uint8_t* get_branch_target(
     // Jump to the address returned by the
     // branch_stub_hit call
     jmp_rm(ocb, RAX);
+
+    perf_region_end(&region, ocb);
 
     return stub_addr;
 }

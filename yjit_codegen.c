@@ -60,18 +60,11 @@ static patch_array_t global_inval_patches = NULL;
 // break out of invalidation race when there are multiple ractors.
 uint32_t yjit_codepage_frozen_bytes = 0;
 
-
-typedef struct perf_region {
-    char range_label[0x400];
-
-    unsigned long range_start;
-} perf_region_t;
-
-static perf_region_t perf_region;
+perf_region_t perf_region;
 
 
 // Note: using strcpy and strcat because this is not menat to be merged
-static void
+void
 perf_region_start(perf_region_t *perf, codeblock_t *cb, const char *label)
 {
     if (perf->range_start) rb_bug("starting while already started");
@@ -79,15 +72,15 @@ perf_region_start(perf_region_t *perf, codeblock_t *cb, const char *label)
     strcpy(perf->range_label, label);
 }
 
-static void
+void
 perf_region_append(perf_region_t *perf, const char *label)
 {
     if (!perf->range_start) rb_bug("append before starting");
     strcat(perf->range_label, label);
 }
 
-static void
-perf_region_end(perf_region_t *perf)
+void
+perf_region_end(perf_region_t *perf, codeblock_t *cb)
 {
     if (!perf->range_start) rb_bug("ending before starting");
     unsigned long current_pos = (unsigned long)cb_get_ptr(cb, cb->write_pos);
@@ -386,6 +379,11 @@ yjit_gen_exit(VALUE *exit_pc, ctx_t *ctx, codeblock_t *cb)
 
     ADD_COMMENT(cb, "exit to interpreter");
 
+    perf_region_t exit_region = {0};
+    if (ocb == cb) {
+        perf_region_start(&exit_region, cb, "_outlined_exit");
+    }
+
     // Generate the code to exit to the interpreters
     // Write the adjusted SP back into the CFP
     if (ctx->sp_offset != 0) {
@@ -416,6 +414,9 @@ yjit_gen_exit(VALUE *exit_pc, ctx_t *ctx, codeblock_t *cb)
     mov(cb, RAX, imm_opnd(Qundef));
     ret(cb);
 
+    if (ocb == cb) {
+        perf_region_end(&exit_region, cb);
+    }
     return code_pos;
 }
 
@@ -428,6 +429,8 @@ yjit_gen_leave_exit(codeblock_t *cb)
     // Note, gen_leave() fully reconstructs interpreter state and leaves the
     // return value in RAX before coming here.
 
+    perf_region_start(&perf_region, cb, "_leave_to_interp");
+
     // Every exit to the interpreter should be counted
     GEN_COUNTER_INC(cb, leave_interp_return);
 
@@ -436,6 +439,7 @@ yjit_gen_leave_exit(codeblock_t *cb)
     pop(cb, REG_CFP);
 
     ret(cb);
+    perf_region_end(&perf_region, cb);
 
     return code_ptr;
 }
@@ -558,6 +562,8 @@ yjit_entry_prologue(const rb_iseq_t *iseq)
     uint8_t *code_ptr = cb_get_ptr(cb, cb->write_pos);
     ADD_COMMENT(cb, "yjit prolog");
 
+    perf_region_start(&perf_region, cb, "_entry_prologue");
+
     push(cb, REG_CFP);
     push(cb, REG_EC);
     push(cb, REG_SP);
@@ -566,13 +572,22 @@ yjit_entry_prologue(const rb_iseq_t *iseq)
     mov(cb, REG_EC, C_ARG_REGS[0]);
     mov(cb, REG_CFP, C_ARG_REGS[1]);
 
+    perf_region_end(&perf_region, cb);
+    perf_region_start(&perf_region, cb, "_entry_prologue_load_sp");
+
     // Load the current SP from the CFP into REG_SP
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
+
+    perf_region_end(&perf_region, cb);
+
+    perf_region_start(&perf_region, cb, "_entry_prologue_store_leave_exit");
 
     // Setup cfp->jit_return
     // TODO: this could use an IP relative LEA instead of an 8 byte immediate
     mov(cb, REG0, const_ptr_opnd(leave_exit_code));
     mov(cb, member_opnd(REG_CFP, rb_control_frame_t, jit_return), REG0);
+
+    perf_region_end(&perf_region, cb);
 
     // We're compiling iseqs that we *expect* to start at `insn_idx`. But in
     // the case of optional parameters, the interpreter can set the pc to a
@@ -581,8 +596,11 @@ yjit_entry_prologue(const rb_iseq_t *iseq)
     // compiled for is the same PC that the interpreter wants us to run with.
     // If they don't match, then we'll take a side exit.
     if (iseq->body->param.flags.has_opt) {
+        perf_region_start(&perf_region, cb, "_entry_prologue_pc_guard");
         yjit_pc_guard(iseq);
+        perf_region_end(&perf_region, cb);
     }
+
 
     return code_ptr;
 }
@@ -729,7 +747,7 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
 
 
 
-        perf_region_end(&perf_region);
+        perf_region_end(&perf_region, cb);
 
 
         // For now, reset the chain depth after each instruction as only the
@@ -745,7 +763,7 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
             perf_region_start(&perf_region, cb, insn_name(opcode));
             perf_region_append(&perf_region, ".cantcompile");
             yjit_gen_exit(jit.pc, ctx, cb);
-            perf_region_end(&perf_region);
+            perf_region_end(&perf_region, cb);
             break;
         }
 
@@ -4195,12 +4213,6 @@ yjit_init_codegen(void)
     ocb = &outline_block;
     cb_init(ocb, mem_block + mem_size/2, mem_size/2);
 
-    // Generate the interpreter exit code for leave
-    leave_exit_code = yjit_gen_leave_exit(cb);
-
-    // Generate full exit code for C func
-    gen_full_cfunc_return();
-
     // open file for perf map file
     // TODO: close it
     {
@@ -4209,6 +4221,12 @@ yjit_init_codegen(void)
         if (ret < 0) rb_bug("snprintf failed");
         perf_map_file = fopen(buf, "w+");
     }
+
+    // Generate the interpreter exit code for leave
+    leave_exit_code = yjit_gen_leave_exit(cb);
+
+    // Generate full exit code for C func
+    gen_full_cfunc_return();
 
     // Map YARV opcodes to the corresponding codegen functions
     yjit_reg_op(BIN(nop), gen_nop);

@@ -52,4 +52,16 @@ void yjit_gen_block(block_t* block, rb_execution_context_t* ec);
 
 void yjit_init_codegen(void);
 
+typedef struct perf_region {
+    char range_label[0x400];
+
+    unsigned long range_start;
+} perf_region_t;
+
+extern perf_region_t perf_region;
+
+void perf_region_start(perf_region_t *perf, codeblock_t *cb, const char *label);
+void perf_region_append(perf_region_t *perf, const char *label);
+void perf_region_end(perf_region_t *perf, codeblock_t *cb);
+
 #endif // #ifndef YJIT_CODEGEN_H
